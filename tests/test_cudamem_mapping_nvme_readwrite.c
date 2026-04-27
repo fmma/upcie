@@ -7,7 +7,6 @@ struct rte {
 	struct hostmem_config config;
 	struct hostmem_heap heap;
 	struct cudamem_config cuda_config;
-	struct cudamem_heap cuda_heap;
 	CUcontext cu_ctx;
 };
 
@@ -21,7 +20,7 @@ rte_init(struct rte *rte)
 {
 	CUdevice cu_dev;
 	int err;
-	
+
 	err = hostmem_config_init(&rte->config);
 	if (err) {
 		printf("FAILED: hostmem_config_init(); err(%d)\n", err);
@@ -33,7 +32,7 @@ rte_init(struct rte *rte)
 		printf("FAILED: hostmem_heap_init(); err(%d)\n", err);
 		return err;
 	}
-	
+
 	err = cuInit(0);
 	if (err) {
 		printf("FAILED: cuInit(); err(%d)\n", err);
@@ -58,17 +57,12 @@ rte_init(struct rte *rte)
 		return err;
 	}
 
-	err = cudamem_heap_init(&rte->cuda_heap, 1024 * 1024 * 128ULL, &rte->cuda_config);
-	if (err) {
-		printf("FAILED: cudamem_heap_init(); err(%d)\n", err);
-		return err;
-	}
-
 	return 0;
 }
 
 int
-nvme_io(struct nvme *nvme, struct cudamem_heap *cuda_heap, uint8_t opc, void *buffer, size_t buffer_size)
+nvme_io(struct nvme *nvme, struct cudamem_mapping_registry *registry,
+	struct cudamem_config *cuda_config, uint8_t opc, void *buffer, size_t buffer_size)
 {
 	struct nvme_completion cpl = {0};
 	struct nvme_command cmd = {0};
@@ -88,7 +82,12 @@ nvme_io(struct nvme *nvme, struct cudamem_heap *cuda_heap, uint8_t opc, void *bu
 	cmd.cdw10 = 0; ///< SLBA == 0
 	cmd.cdw12 = 0; ///< NLB == 0
 
-	nvme_request_prep_command_prps_contig_cuda_heap(req, cuda_heap, buffer, buffer_size, &cmd);
+	err = nvme_request_prep_command_prps_contig_cuda_mapped(req, registry, cuda_config, buffer,
+								buffer_size, &cmd);
+	if (err) {
+		printf("FAILED: prps_contig_cuda_mapped(); err(%d)\n", err);
+		return err;
+	}
 
 	err = nvme_qpair_enqueue(&nvme->ioq, &cmd);
 	if (err) {
@@ -155,9 +154,12 @@ main(int argc, char **argv)
 {
 	struct nvme nvme = {0};
 	struct rte rte = {0};
+	struct cudamem_mapping_registry registry = {0};
 	const size_t buffer_size = 82 * sizeof(char);
-	void *write_buf = NULL, *read_buf = NULL;	///< CUDA IO buffers
-	char *expected = NULL, *actual = NULL;		///< HOST buffers for comparison
+	size_t mapping_size;
+	CUdeviceptr raw_write = 0, raw_read = 0;
+	void *write_buf = NULL, *read_buf = NULL; ///< CUDA IO buffers
+	char *expected = NULL, *actual = NULL;    ///< HOST buffers for comparison
 	int err;
 
 	if (argc != 2) {
@@ -177,17 +179,37 @@ main(int argc, char **argv)
 		return err;
 	}
 
-	write_buf = cudamem_dma_malloc(&rte.cuda_heap, buffer_size);
-	if (!write_buf) {
-		err = errno;
-		printf("FAILED: cudamem_dma_malloc(write_buf); err(%d)\n", err);
+	err = cudamem_mapping_registry_init(&registry, &rte.cuda_config);
+	if (err) {
+		printf("FAILED: cudamem_mapping_registry_init(); err(%d)\n", err);
 		goto exit;
 	}
 
-	read_buf = cudamem_dma_malloc(&rte.cuda_heap, buffer_size);
-	if (!read_buf) {
-		err = errno;
-		printf("FAILED: cudamem_dma_malloc(read_buf); err(%d)\n", err);
+	mapping_size = rte.cuda_config.pagesize;
+
+	err = (cuMemAlloc(&raw_write, mapping_size) == CUDA_SUCCESS) ? 0 : -ENOMEM;
+	if (err) {
+		printf("FAILED: cuMemAlloc(write); err(%d)\n", err);
+		goto exit;
+	}
+	write_buf = (void *)raw_write;
+
+	err = (cuMemAlloc(&raw_read, mapping_size) == CUDA_SUCCESS) ? 0 : -ENOMEM;
+	if (err) {
+		printf("FAILED: cuMemAlloc(read); err(%d)\n", err);
+		goto exit;
+	}
+	read_buf = (void *)raw_read;
+
+	err = cudamem_mapping_add(&registry, &rte.cuda_config, write_buf, mapping_size, NULL);
+	if (err) {
+		printf("FAILED: cudamem_mapping_add(write); err(%d)\n", err);
+		goto exit;
+	}
+
+	err = cudamem_mapping_add(&registry, &rte.cuda_config, read_buf, mapping_size, NULL);
+	if (err) {
+		printf("FAILED: cudamem_mapping_add(read); err(%d)\n", err);
 		goto exit;
 	}
 
@@ -209,7 +231,7 @@ main(int argc, char **argv)
 	for (size_t i = 0; i < buffer_size; i++) {
 		expected[i] = (i % 26) + 65;
 	}
-	
+
 	memset(actual, 0, buffer_size);
 
 	err = cuMemcpyHtoD((CUdeviceptr)write_buf, expected, buffer_size);
@@ -224,19 +246,18 @@ main(int argc, char **argv)
 		goto exit;
 	}
 
-	err = nvme_io(&nvme, &rte.cuda_heap, 0x1, write_buf, buffer_size);
+	err = nvme_io(&nvme, &registry, &rte.cuda_config, 0x1, write_buf, buffer_size);
 	if (err) {
 		printf("FAILED: nvme_io(write); err(%d)\n", err);
 		goto exit;
 	}
 
-	err = nvme_io(&nvme, &rte.cuda_heap, 0x2, read_buf, buffer_size);
+	err = nvme_io(&nvme, &registry, &rte.cuda_config, 0x2, read_buf, buffer_size);
 	if (err) {
 		printf("FAILED: nvme_io(read); err(%d)\n", err);
 		goto exit;
 	}
 
-	
 	err = cuMemcpyDtoH(actual, (CUdeviceptr)read_buf, buffer_size);
 	if (err) {
 		printf("FAILED: cuMemcpyDtoH(read_buf -> actual); err(%d)\n", err);
@@ -254,13 +275,17 @@ main(int argc, char **argv)
 	printf("SUCCES: written data == read data\n");
 
 exit:
-	cudamem_dma_free(&rte.cuda_heap, write_buf);
-	cudamem_dma_free(&rte.cuda_heap, read_buf);
+	cudamem_mapping_registry_term(&registry);
+	if (raw_write) {
+		cuMemFree(raw_write);
+	}
+	if (raw_read) {
+		cuMemFree(raw_read);
+	}
 	free(expected);
 	free(actual);
 	nvme_controller_close(&nvme.ctrlr);
 	hostmem_heap_term(&rte.heap);
-	cudamem_heap_term(&rte.cuda_heap);
 	cuCtxDestroy(rte.cu_ctx);
 
 	return err;
