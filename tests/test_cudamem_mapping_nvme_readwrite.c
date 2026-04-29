@@ -61,7 +61,7 @@ rte_init(struct rte *rte)
 }
 
 int
-nvme_io(struct nvme *nvme, struct cudamem_mapping *mappings, uint8_t opc, void *buffer,
+nvme_io(struct nvme *nvme, struct cudamem_mapping_registry *registry, uint8_t opc, void *buffer,
 	size_t buffer_size)
 {
 	struct nvme_completion cpl = {0};
@@ -82,7 +82,7 @@ nvme_io(struct nvme *nvme, struct cudamem_mapping *mappings, uint8_t opc, void *
 	cmd.cdw10 = 0; ///< SLBA == 0
 	cmd.cdw12 = 0; ///< NLB == 0
 
-	err = nvme_request_prep_command_prps_contig_cuda_mapped(req, mappings, buffer, buffer_size,
+	err = nvme_request_prep_command_prps_contig_cuda_mapped(req, registry, buffer, buffer_size,
 								&cmd);
 	if (err) {
 		printf("FAILED: prps_contig_cuda_mapped(); err(%d)\n", err);
@@ -153,9 +153,9 @@ main(int argc, char **argv)
 {
 	struct nvme nvme = {0};
 	struct rte rte = {0};
-	struct cudamem_mapping *mappings = NULL;
+	struct cudamem_mapping_registry registry = {0};
 	const size_t buffer_size = 82 * sizeof(char);
-	size_t mapping_size, page;
+	size_t mapping_size;
 	CUdeviceptr raw_write = 0, raw_read = 0;
 	void *write_buf = NULL, *read_buf = NULL;	///< CUDA IO buffers
 	char *expected = NULL, *actual = NULL;		///< HOST buffers for comparison
@@ -178,35 +178,33 @@ main(int argc, char **argv)
 		return err;
 	}
 
-	/*
-	 * cudamem_mapping requires vaddr and nbytes aligned to device_pagesize.
-	 * cuMemAlloc does not guarantee that alignment, so over-allocate by one
-	 * page and round the start up.
-	 */
-	page = rte.cuda_config.device_pagesize;
-	mapping_size = page;
-
-	err = cuMemAlloc(&raw_write, mapping_size + page);
+	err = cudamem_mapping_registry_init(&registry, &rte.cuda_config);
 	if (err) {
-		printf("FAILED: cuMemAlloc(write); err(%d)\n", err);
+		printf("FAILED: cudamem_mapping_registry_init(); err(%d)\n", err);
 		goto exit;
 	}
-	write_buf = (void *)(((uintptr_t)raw_write + page - 1) & ~((uintptr_t)page - 1));
 
-	err = cuMemAlloc(&raw_read, mapping_size + page);
+	err = cudamem_alloc_aligned(&rte.cuda_config, buffer_size, &raw_write, &write_buf,
+				    &mapping_size);
 	if (err) {
-		printf("FAILED: cuMemAlloc(read); err(%d)\n", err);
+		printf("FAILED: cudamem_alloc_aligned(write); err(%d)\n", err);
 		goto exit;
 	}
-	read_buf = (void *)(((uintptr_t)raw_read + page - 1) & ~((uintptr_t)page - 1));
 
-	err = cudamem_mapping_add(&mappings, write_buf, mapping_size, &rte.cuda_config, NULL);
+	err = cudamem_alloc_aligned(&rte.cuda_config, buffer_size, &raw_read, &read_buf,
+				    &mapping_size);
+	if (err) {
+		printf("FAILED: cudamem_alloc_aligned(read); err(%d)\n", err);
+		goto exit;
+	}
+
+	err = cudamem_mapping_add(&registry, write_buf, mapping_size, NULL);
 	if (err) {
 		printf("FAILED: cudamem_mapping_add(write); err(%d)\n", err);
 		goto exit;
 	}
 
-	err = cudamem_mapping_add(&mappings, read_buf, mapping_size, &rte.cuda_config, NULL);
+	err = cudamem_mapping_add(&registry, read_buf, mapping_size, NULL);
 	if (err) {
 		printf("FAILED: cudamem_mapping_add(read); err(%d)\n", err);
 		goto exit;
@@ -245,13 +243,13 @@ main(int argc, char **argv)
 		goto exit;
 	}
 
-	err = nvme_io(&nvme, mappings, 0x1, write_buf, buffer_size);
+	err = nvme_io(&nvme, &registry, 0x1, write_buf, buffer_size);
 	if (err) {
 		printf("FAILED: nvme_io(write); err(%d)\n", err);
 		goto exit;
 	}
 
-	err = nvme_io(&nvme, mappings, 0x2, read_buf, buffer_size);
+	err = nvme_io(&nvme, &registry, 0x2, read_buf, buffer_size);
 	if (err) {
 		printf("FAILED: nvme_io(read); err(%d)\n", err);
 		goto exit;
@@ -274,7 +272,7 @@ main(int argc, char **argv)
 	printf("SUCCES: written data == read data\n");
 
 exit:
-	cudamem_mapping_clear(&mappings);
+	cudamem_mapping_registry_term(&registry);
 	if (raw_write) {
 		cuMemFree(raw_write);
 	}
