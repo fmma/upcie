@@ -1170,6 +1170,102 @@ probe9_done:
 	}
 probe11_done:
 
+	/* Probe 12: phys contiguity within a slab, across many slabs.
+	 *
+	 * The slab-LUT design assumes that within a single 2 MiB chunk
+	 * exported via cuMemGetHandleForAddressRange, the host-page phys
+	 * entries are contiguous (phys[i] == phys[0] + i * pagesize). This
+	 * follows from the BAR1 page table mapping at slab granularity, but
+	 * verify empirically across many chunks to confirm the property is
+	 * not occasionally violated (e.g., by fragmented BAR1 PT walks).
+	 *
+	 * Allocate a multi-slab region, walk slab-aligned windows within it,
+	 * export each, and check contiguity of the LUT. */
+	{
+		const size_t slab = (size_t)2 * 1024 * 1024;
+		const size_t nslabs_test = 32;
+		const size_t big_sz = slab * nslabs_test;
+		CUdeviceptr big = 0;
+		cr = cuMemAlloc(&big, big_sz);
+		if (cr != CUDA_SUCCESS) {
+			printf("# probe 12: cuMemAlloc(%zu) cr=%d\n", big_sz, cr);
+			goto probe12_done;
+		}
+
+		const uintptr_t big_addr = (uintptr_t)big;
+		const uintptr_t base_aligned = (big_addr + slab - 1) & ~(uintptr_t)(slab - 1);
+		const size_t lut_n = slab / host_page;
+		uint64_t *lut = calloc(lut_n, sizeof(uint64_t));
+		if (!lut) {
+			printf("# probe 12: calloc failed\n");
+			cuMemFree(big);
+			goto probe12_done;
+		}
+
+		size_t chunks_checked = 0;
+		size_t chunks_contig = 0;
+		size_t first_violation_at = (size_t)-1;
+		uint64_t first_violation_phys[2] = {0, 0};
+		size_t first_violation_idx = 0;
+
+		const size_t walkable = (big_sz - (base_aligned - big_addr)) / slab;
+		for (size_t s = 0; s < walkable; ++s) {
+			const uintptr_t chunk_va = base_aligned + s * slab;
+			int fd = -1;
+			cr = cuMemGetHandleForAddressRange(&fd, (CUdeviceptr)chunk_va, slab,
+							   CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+			if (cr != CUDA_SUCCESS) {
+				continue;
+			}
+			struct dmabuf db = {0};
+			err = dmabuf_attach(fd, &db);
+			if (err) {
+				close(fd);
+				continue;
+			}
+			err = dmabuf_get_lut(&db, lut_n, lut, (int)host_page);
+			if (err == 0) {
+				chunks_checked++;
+				int contig = 1;
+				for (size_t i = 1; i < lut_n; ++i) {
+					if (lut[i] != lut[0] + i * host_page) {
+						contig = 0;
+						if (first_violation_at == (size_t)-1) {
+							first_violation_at = s;
+							first_violation_idx = i;
+							first_violation_phys[0] = lut[0];
+							first_violation_phys[1] = lut[i];
+						}
+						break;
+					}
+				}
+				if (contig) {
+					chunks_contig++;
+				}
+			}
+			dmabuf_detach(&db);
+		}
+
+		printf("# probe 12: chunks_checked=%zu chunks_contig=%zu\n",
+		       chunks_checked, chunks_contig);
+		if (chunks_checked == chunks_contig && chunks_checked > 0) {
+			printf("# probe 12: PASS - all chunks contiguous; slab-LUT design "
+			       "viable\n");
+		} else if (chunks_checked == 0) {
+			printf("# probe 12: SKIP - no chunks could be checked\n");
+		} else {
+			printf("# probe 12: FAIL - first violation at chunk %zu, page %zu: "
+			       "phys[0]=0x%" PRIx64 " phys[%zu]=0x%" PRIx64 "\n",
+			       first_violation_at, first_violation_idx,
+			       first_violation_phys[0], first_violation_idx,
+			       first_violation_phys[1]);
+		}
+
+		free(lut);
+		cuMemFree(big);
+	}
+probe12_done:
+
 	cuMemFree(raw);
 	return 0;
 }

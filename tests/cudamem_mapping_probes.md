@@ -158,6 +158,22 @@ This gives a portable query for the cache chunk size, which is needed
 because the value is per-device by API contract (and varies in practice
 across GPU architectures).
 
+### Probe 12: phys contiguity within a slab
+
+Allocate 64 MiB (32 slabs). For each slab-aligned window, export it as a
+separate dmabuf, fetch the 512-page LUT, and verify
+`lut[i] == lut[0] + i * pagesize` for all `i`.
+
+```
+probe 12: chunks_checked=32 chunks_contig=32
+probe 12: PASS - all chunks contiguous; slab-LUT design viable
+```
+
+Conclusion: each chunk export receives a single contiguous BAR1 IOVA
+window. This is consistent with BAR1 large-page mapping at slab granularity.
+A registry that stores one phys base per chunk and computes per-page phys as
+`base + (va & (slab - 1))` is sound on this hardware.
+
 ## Design implications
 
 The cache should:
@@ -167,9 +183,15 @@ The cache should:
   size at config-init time, store on `cudamem_config`. Do not hardcode 2 MiB.
 - Manage one dma-buf per chunk, with a refcount. `_add` rounds out to chunk
   boundaries, ref-bumps existing entries, populates new entries via
-  `cuMemGetHandleForAddressRange(chunk_floor, chunk)` and `dmabuf_get_lut`.
-- Resolve `virt_to_phys` against the cache: `chunk = cache[va >> shift]`,
-  `phys = chunk->phys_lut[(va - chunk->base) >> page_shift]`.
-- Free dmabufs only when the cache rc reaches zero. Until then, repeated
+  `cuMemGetHandleForAddressRange(chunk_floor, chunk)`.
+- Store one `phys_base` per chunk (probe 12 verified contiguity); resolve
+  `virt_to_phys` as `chunk->phys_base + (va & (slab - 1))`. The host-page
+  LUT used in the existing registry can be eliminated, reducing memory by
+  the slab/pagesize ratio (512x for 4 KiB pages and 2 MiB slabs).
+- At chunk init, populate `phys_base` by calling `dmabuf_get_lut` for the
+  full slab and asserting contiguity, then storing `lut[0]`. Refuse with
+  `-EOPNOTSUPP` on violation; this guards against hardware where the BAR1
+  large-page assumption does not hold.
+- Free dmabufs only when the chunk rc reaches zero. Until then, repeated
   `_add`/`_remove` cycles touching the same chunk pay zero CUDA cost and
-  preserve phys identity (rc-share-phys at the cache layer).
+  preserve phys identity.
