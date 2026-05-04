@@ -505,6 +505,107 @@ test_cross_chunk_mapping(struct cudamem_mapping_registry *registry, struct cudam
 	return 0;
 }
 
+/* A registration whose floored range is fully contained in an existing
+ * handle's floored range must reuse that handle (one fd, not two), and the
+ * contained registration must resolve to the same phys as the parent. */
+static int
+test_subrange_reuses_handle(struct cudamem_mapping_registry *registry,
+			    struct cudamem_config *config)
+{
+	const size_t page = (size_t)config->pagesize;
+	const size_t gran = config->alloc_granularity;
+	CUdeviceptr raw = 0;
+	void *super = NULL;
+	void *sub = NULL;
+	uint64_t phys_super = 0, phys_sub = 0;
+	int err;
+
+	printf("# test_subrange_reuses_handle\n");
+
+	err = (cuMemAlloc(&raw, 2 * gran) == CUDA_SUCCESS) ? 0 : -ENOMEM;
+	EXPECT_EQ("cuMemAlloc", err, 0);
+	super = (void *)raw;
+	sub = (uint8_t *)super + page;
+
+	err = cudamem_mapping_add(registry, config, super, 2 * gran, NULL);
+	EXPECT_EQ("add(super)", err, 0);
+
+	int n_handles_before = 0;
+	for (struct cudamem_mapping_handle *h = registry->handles; h; h = h->next) {
+		n_handles_before++;
+	}
+	EXPECT_EQ("handles after add(super)", n_handles_before, 1);
+
+	/* sub's floored range = [super_floored, super_floored + gran), which is
+	 * contained in super's floored range = [super_floored, super_floored +
+	 * 2*gran). Must reuse the handle. */
+	err = cudamem_mapping_add(registry, config, sub, page, NULL);
+	EXPECT_EQ("add(sub contained in super)", err, 0);
+
+	int n_handles_after = 0;
+	for (struct cudamem_mapping_handle *h = registry->handles; h; h = h->next) {
+		n_handles_after++;
+	}
+	EXPECT_EQ("handles after add(sub)", n_handles_after, 1);
+	EXPECT_EQ("handles[0]->rc", (int)registry->handles->rc, 2);
+
+	err = cudamem_mapping_virt_to_phys(registry, super, &phys_super);
+	EXPECT_EQ("virt_to_phys(super)", err, 0);
+	err = cudamem_mapping_virt_to_phys(registry, sub, &phys_sub);
+	EXPECT_EQ("virt_to_phys(sub)", err, 0);
+	if (phys_sub != phys_super + page) {
+		printf("# FAILED: sub phys mismatch; got(0x%" PRIx64 ") want(0x%" PRIx64 ")\n",
+		       phys_sub, phys_super + page);
+		return 1;
+	}
+
+	cudamem_mapping_clear(registry);
+	cuMemFree(raw);
+	return 0;
+}
+
+/* A registration whose floored range partially overlaps an existing handle
+ * without containment must be rejected with -EEXIST, and the registry must
+ * be unchanged after the rejection. */
+static int
+test_partial_overlap_rejected(struct cudamem_mapping_registry *registry,
+			      struct cudamem_config *config)
+{
+	const size_t gran = config->alloc_granularity;
+	CUdeviceptr raw = 0;
+	void *base = NULL;
+	uint64_t phys = 0;
+	int err;
+
+	printf("# test_partial_overlap_rejected\n");
+
+	err = (cuMemAlloc(&raw, 4 * gran) == CUDA_SUCCESS) ? 0 : -ENOMEM;
+	EXPECT_EQ("cuMemAlloc", err, 0);
+	base = (void *)raw;
+
+	/* First registration covers chunks [0, 2). */
+	err = cudamem_mapping_add(registry, config, base, 2 * gran, NULL);
+	EXPECT_EQ("add(first)", err, 0);
+
+	/* Second registration covers chunks [1, 3); overlaps but not contained. */
+	err = cudamem_mapping_add(registry, config, (uint8_t *)base + gran, 2 * gran, NULL);
+	EXPECT_EQ("add(partial overlap)", err, -EEXIST);
+
+	/* First registration must still resolve. */
+	err = cudamem_mapping_virt_to_phys(registry, base, &phys);
+	EXPECT_EQ("virt_to_phys(first)", err, 0);
+
+	int n_handles = 0;
+	for (struct cudamem_mapping_handle *h = registry->handles; h; h = h->next) {
+		n_handles++;
+	}
+	EXPECT_EQ("handles after rejection", n_handles, 1);
+
+	cudamem_mapping_clear(registry);
+	cuMemFree(raw);
+	return 0;
+}
+
 int
 main(void)
 {
@@ -581,6 +682,14 @@ main(void)
 		goto exit;
 	}
 	err = test_cross_chunk_mapping(&registry, &config);
+	if (err) {
+		goto exit;
+	}
+	err = test_subrange_reuses_handle(&registry, &config);
+	if (err) {
+		goto exit;
+	}
+	err = test_partial_overlap_rejected(&registry, &config);
 	if (err) {
 		goto exit;
 	}
