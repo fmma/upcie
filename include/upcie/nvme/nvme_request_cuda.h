@@ -29,9 +29,9 @@
  * @param cmd Pointer to the NVMe command to be prepared with PRP entries.
  */
 static inline void
-nvme_request_prep_command_prps_contig_cuda_heap(struct nvme_request *request,
-						struct cudamem_heap *heap, void *dbuf,
-						size_t dbuf_nbytes, struct nvme_command *cmd)
+nvme_request_prep_command_prps_contig_cuda(struct nvme_request *request, struct cudamem_heap *heap,
+					   void *dbuf, size_t dbuf_nbytes,
+					   struct nvme_command *cmd)
 {
 	const uint64_t npages =
 		(dbuf_nbytes + heap->config->pagesize - 1) >> heap->config->pagesize_shift;
@@ -76,9 +76,9 @@ nvme_request_prep_command_prps_contig_cuda_heap(struct nvme_request *request,
  * @param cmd Pointer to the NVMe command to be prepared with PRP entries.
  */
 static inline void
-nvme_request_prep_command_prps_iov_cuda_heap(struct nvme_request *request,
-					     struct cudamem_heap *heap, struct iovec *dvec,
-					     size_t dvec_cnt, struct nvme_command *cmd)
+nvme_request_prep_command_prps_iov_cuda(struct nvme_request *request, struct cudamem_heap *heap,
+					struct iovec *dvec, size_t dvec_cnt,
+					struct nvme_command *cmd)
 {
 	const uint64_t pagesize = heap->config->pagesize;
 	uint64_t *prp_list = (uint64_t *)request->prp;
@@ -119,8 +119,7 @@ nvme_request_prep_command_prps_iov_cuda_heap(struct nvme_request *request,
  * The buffer is resolved page-by-page through the registry's chunk cache,
  * with no contiguity assumption. This variant is for buffers registered via
  * cudamem_mapping; heap-allocated buffers should use
- * nvme_request_prep_command_prps_contig_cuda_heap() instead. Most call sites
- * should use nvme_request_prep_command_prps_contig_cuda(), which dispatches.
+ * nvme_request_prep_command_prps_contig_cuda() instead.
  *
  * Caveats
  * -------
@@ -186,9 +185,7 @@ nvme_request_prep_command_prps_contig_cuda_mapped(struct nvme_request *request,
  *
  * Each entry is resolved page-by-page through the registry's chunk cache.
  * This variant is for iovecs registered via cudamem_mapping; heap-allocated
- * iovecs should use nvme_request_prep_command_prps_iov_cuda_heap() instead.
- * Most call sites should use nvme_request_prep_command_prps_iov_cuda(),
- * which dispatches.
+ * iovecs should use nvme_request_prep_command_prps_iov_cuda() instead.
  *
  * Each `dvec[i].iov_base` must be host-page-aligned (every PRP-list entry
  * must be page-aligned per NVMe spec); asserted.
@@ -255,53 +252,4 @@ nvme_request_prep_command_prps_iov_cuda_mapped(struct nvme_request *request,
 	}
 
 	return 0;
-}
-
-/**
- * Prepare PRPs for a contiguous CUDA data buffer, dispatching by location.
- *
- * If `dbuf` lies inside `heap`, this defers to
- * nvme_request_prep_command_prps_contig_cuda_heap(); otherwise it resolves
- * via the mapping registry.
- *
- * @return 0 on success, negative errno on failure.
- */
-static inline int
-nvme_request_prep_command_prps_contig_cuda(struct nvme_request *request, struct cudamem_heap *heap,
-					   struct cudamem_mapping_registry *registry, void *dbuf,
-					   size_t dbuf_nbytes, struct nvme_command *cmd)
-{
-	if (cudamem_heap_contains(heap, dbuf)) {
-		nvme_request_prep_command_prps_contig_cuda_heap(request, heap, dbuf, dbuf_nbytes,
-								cmd);
-		return 0;
-	}
-
-	return nvme_request_prep_command_prps_contig_cuda_mapped(request, registry, heap->config,
-								 dbuf, dbuf_nbytes, cmd);
-}
-
-/**
- * Prepare PRPs for a CUDA iovec data buffer, dispatching by location.
- *
- * If `dvec[0].iov_base` lies inside `heap`, this defers to
- * nvme_request_prep_command_prps_iov_cuda_heap(); otherwise it resolves via
- * the mapping registry. The dispatcher only inspects the first entry; the
- * called variant enforces its own placement rules across the rest.
- *
- * @return 0 on success, negative errno on failure.
- */
-static inline int
-nvme_request_prep_command_prps_iov_cuda(struct nvme_request *request, struct cudamem_heap *heap,
-					struct cudamem_mapping_registry *registry,
-					struct iovec *dvec, size_t dvec_cnt,
-					struct nvme_command *cmd)
-{
-	if (dvec_cnt > 0 && cudamem_heap_contains(heap, dvec[0].iov_base)) {
-		nvme_request_prep_command_prps_iov_cuda_heap(request, heap, dvec, dvec_cnt, cmd);
-		return 0;
-	}
-
-	return nvme_request_prep_command_prps_iov_cuda_mapped(request, registry, heap->config, dvec,
-							      dvec_cnt, cmd);
 }
